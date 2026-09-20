@@ -12,6 +12,47 @@ interface ReceiptScannerModalProps {
   activeMemberId: string;
 }
 
+// Helper to compress image on client-side before sending to server/Vercel
+function compressReceiptImage(file: File, maxDim = 1280, quality = 0.85): Promise<{ base64: string; mimeType: string }> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressed = canvas.toDataURL('image/jpeg', quality);
+          resolve({ base64: compressed, mimeType: 'image/jpeg' });
+        } else {
+          resolve({ base64: e.target?.result as string, mimeType: file.type || 'image/jpeg' });
+        }
+      };
+      img.onerror = () => {
+        resolve({ base64: e.target?.result as string, mimeType: file.type || 'image/jpeg' });
+      };
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = () => {
+      resolve({ base64: '', mimeType: file.type || 'image/jpeg' });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 export default function ReceiptScannerModal({
   isOpen,
   onClose,
@@ -41,22 +82,31 @@ export default function ReceiptScannerModal({
 
   if (!isOpen) return null;
 
-  const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
+  const handleFileSelect = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setScanError(null);
-    setMimeType(file.type || 'image/jpeg');
+    setIsScanning(true);
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      setImagePreview(result);
+    try {
+      // Compress image client-side to ensure fast upload & fit within serverless limits
+      const { base64, mimeType: compressedMime } = await compressReceiptImage(file);
+      if (!base64) {
+        throw new Error('Gagal memuat file gambar');
+      }
+
+      setImagePreview(base64);
+      setMimeType(compressedMime);
       setHasScanned(false);
-      // Auto-trigger scan
-      performReceiptScan(result, file.type || 'image/jpeg');
-    };
-    reader.readAsDataURL(file);
+
+      // Trigger OCR
+      await performReceiptScan(base64, compressedMime);
+    } catch (err: any) {
+      setScanError(err.message || 'Gagal membaca berkas gambar.');
+      setHasScanned(true);
+      setIsScanning(false);
+    }
   };
 
   const performReceiptScan = async (base64Img: string, mime: string) => {
@@ -73,9 +123,33 @@ export default function ReceiptScannerModal({
         }),
       });
 
-      const resData = await response.json();
-      if (!resData.success) {
-        throw new Error(resData.error || 'Gagal mengenali bon belanja');
+      // Safely parse text first to prevent "Unexpected end of JSON input"
+      let resData: any = null;
+      try {
+        const rawText = await response.text();
+        if (rawText && rawText.trim()) {
+          try {
+            resData = JSON.parse(rawText);
+          } catch {
+            // response was not JSON
+          }
+        }
+      } catch {
+        // failed to read response body
+      }
+
+      if (!response.ok) {
+        if (response.status === 404 || response.status === 405) {
+          throw new Error('Layanan AI scanner backend belum aktif di platform hosting ini atau kunci GEMINI_API_KEY belum diisi di Environment Variables Vercel.');
+        }
+        if (response.status === 413) {
+          throw new Error('Ukuran foto terlalu besar untuk diproses server.');
+        }
+        throw new Error(resData?.error || `Server mengembalikan status ${response.status}`);
+      }
+
+      if (!resData || !resData.success) {
+        throw new Error(resData?.error || 'Format respon pemindaian bon tidak sesuai.');
       }
 
       const data: ParsedReceiptData = resData.data;
@@ -87,8 +161,8 @@ export default function ReceiptScannerModal({
       setNotes(`Dipindai otomatis dari struk ${data.merchant || 'belanja'}`);
       setHasScanned(true);
     } catch (err: any) {
-      console.error('Scan error:', err);
-      setScanError(err.message || 'Terjadi gangguan saat memindai foto. Silakan input rincian secara manual.');
+      console.warn('Scan error caught safely:', err);
+      setScanError(err.message || 'Terjadi gangguan saat memindai foto.');
       setHasScanned(true);
     } finally {
       setIsScanning(false);
